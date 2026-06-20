@@ -1,0 +1,1401 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+STATE_DIR="${HOME}/.git-plus"
+PAUSE_STATE_FILE="${STATE_DIR}/pause-state"
+
+usage() {
+  cat <<'EOF'
+usage: git-plus <command> [args...]
+EOF
+}
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+ensure_state_dir() {
+  mkdir -p "$STATE_DIR"
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "'$1' が見つかりません。"
+}
+
+require_git_repo() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Git リポジトリ内で実行してください。"
+}
+
+require_gh() {
+  require_command gh
+}
+
+confirm() {
+  local prompt="${1:-続行しますか?}"
+  local default="${2:-N}"
+  local suffix="[y/N]"
+  if [[ "$default" == "Y" ]]; then
+    suffix="[Y/n]"
+  fi
+  local answer
+  read -r -p "${prompt} ${suffix}: " answer || true
+  answer="${answer//[[:space:]]/}"
+  if [[ -z "$answer" ]]; then
+    [[ "$default" == "Y" ]]
+    return
+  fi
+  [[ "$answer" =~ ^([yY]|[yY][eE][sS])$ ]]
+}
+
+open_editor() {
+  local file="$1"
+  local editor
+  editor="$(git config --get core.editor 2>/dev/null || true)"
+  if [[ -z "$editor" ]]; then
+    editor="${VISUAL:-${EDITOR:-vi}}"
+  fi
+  eval "$editor \"\$file\""
+}
+
+normalize_fullwidth_digits() {
+  printf '%s' "$1" | tr '０１２３４５６７８９' '0123456789'
+}
+
+git_current_branch() {
+  git branch --show-current
+}
+
+default_remote_branch() {
+  local ref
+  ref="$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || true)"
+  if [[ -n "$ref" ]]; then
+    basename "$ref"
+    return
+  fi
+  if git show-ref --verify --quiet refs/remotes/origin/main; then
+    printf 'main\n'
+    return
+  fi
+  if git show-ref --verify --quiet refs/remotes/origin/master; then
+    printf 'master\n'
+    return
+  fi
+  die "origin のデフォルトブランチを判定できません。"
+}
+
+github_owner_repo_from_url() {
+  local url="$1"
+  url="${url%.git}"
+  if [[ "$url" =~ ^https://github\.com/([^/]+)/([^/]+)$ ]]; then
+    printf '%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    return
+  fi
+  if [[ "$url" =~ ^git@github\.com:([^/]+)/([^/]+)$ ]]; then
+    printf '%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    return
+  fi
+  return 1
+}
+
+github_compare_url() {
+  local origin
+  origin="$(git remote get-url origin 2>/dev/null || true)"
+  [[ -n "$origin" ]] || return 1
+  local parsed owner repo
+  parsed="$(github_owner_repo_from_url "$origin")" || return 1
+  owner="${parsed%%$'\t'*}"
+  repo="${parsed##*$'\t'}"
+  printf 'https://github.com/%s/%s/compare/%s...%s\n' "$owner" "$repo" "$1" "$2"
+}
+
+save_pause_state() {
+  ensure_state_dir
+  cat >"$PAUSE_STATE_FILE" <<EOF
+from_branch=$1
+to_branch=$2
+stash_ref=$3
+EOF
+}
+
+load_pause_state() {
+  [[ -f "$PAUSE_STATE_FILE" ]] || die "pause 状態がありません。"
+  # shellcheck disable=SC1090
+  source "$PAUSE_STATE_FILE"
+}
+
+clear_pause_state() {
+  rm -f "$PAUSE_STATE_FILE"
+}
+
+has_worktree_changes() {
+  ! git diff --quiet || ! git diff --cached --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]
+}
+
+stash_push_with_message() {
+  local message="$1"
+  git stash push -u -m "$message" >/dev/null
+  git stash list | head -n1 | cut -d: -f1
+}
+
+render_issue_edit_template() {
+  local file="$1"
+  local number="$2"
+  local title="$3"
+  local body="$4"
+  local url="$5"
+  cat >"$file" <<EOF
+# Issue #$number
+# URL: $url
+# 'Title:' の後にタイトル、'---' の後に本文を記載してください。
+
+Title: $title
+
+---
+$body
+EOF
+}
+
+render_issue_create_template() {
+  local file="$1"
+  cat >"$file" <<'EOF'
+# 新しいIssueを作成
+# 'Title:' の後にタイトル、'---' の後に本文を記載してください。
+
+Title:
+
+---
+
+EOF
+}
+
+render_comment_template() {
+  local file="$1"
+  local header="$2"
+  cat >"$file" <<EOF
+# $header
+# コメントを入力してください。空ならコメントなしです。
+
+EOF
+}
+
+parse_issue_file() {
+  local file="$1"
+  awk '
+    BEGIN { mode="title" }
+    /^#/ { next }
+    /^---$/ { mode="body"; next }
+    mode=="title" && /^Title:/ {
+      sub(/^Title:[[:space:]]*/, "", $0)
+      print "TITLE\t" $0
+      next
+    }
+    mode=="body" { print "BODY\t" $0 }
+  ' "$file"
+}
+
+editor_body_from_file() {
+  local file="$1"
+  awk 'BEGIN{first=1} /^#/ {next} { if (!first) printf "\n"; printf "%s", $0; first=0 }' "$file"
+}
+
+select_from_numbered_list() {
+  local prompt="$1"
+  local max="$2"
+  local input
+  read -r -p "$prompt" input || true
+  input="$(normalize_fullwidth_digits "${input:-}")"
+  [[ -n "$input" ]] || return 1
+  [[ "$input" =~ ^[0-9]+$ ]] || return 1
+  (( input >= 1 && input <= max )) || return 1
+  printf '%s\n' "$input"
+}
+
+get_issue_tsv() {
+  gh issue list --state open --limit 100 --json number,title,body,url --jq '.[] | [.number, .title, (.body // "" | gsub("\r?\n"; " ")), .url] | @tsv'
+}
+
+choose_issue() {
+  mapfile -t ISSUE_ROWS < <(get_issue_tsv)
+  [[ ${#ISSUE_ROWS[@]} -gt 0 ]] || die "Open Issue が見つかりません。"
+  local i number title body url
+  printf 'Open Issue 一覧 (%d 件):\n\n' "${#ISSUE_ROWS[@]}"
+  for i in "${!ISSUE_ROWS[@]}"; do
+    IFS=$'\t' read -r number title body url <<<"${ISSUE_ROWS[$i]}"
+    printf '%d. #%s: %s\n' "$((i + 1))" "$number" "$title"
+    [[ -n "$body" ]] && printf '   %s\n' "${body:0:80}"
+    printf '\n'
+  done
+  local selected
+  selected="$(select_from_numbered_list "番号を入力してください (Enterでキャンセル): " "${#ISSUE_ROWS[@]}")" || return 1
+  printf '%s\n' "${ISSUE_ROWS[$((selected - 1))]}"
+}
+
+cmd_newbranch() {
+  require_git_repo
+  [[ "${1:-}" =~ ^(-h|--help)$ ]] && { printf 'usage: git newbranch <branch>\n'; return; }
+  local branch="${1:-}"
+  [[ -n "$branch" ]] || die "ブランチ名を指定してください。"
+  if git show-ref --verify --quiet "refs/heads/$branch"; then
+    printf "ブランチ '%s' は既に存在します。\n" "$branch"
+    read -r -p "[r]ecreate / [s]witch / [c]ancel: " action || true
+    case "${action:-c}" in
+      r|R) git branch -D "$branch" ;;
+      s|S) git checkout "$branch"; return ;;
+      *) printf 'キャンセルしました。\n'; return ;;
+    esac
+  fi
+  git checkout -b "$branch"
+}
+
+cmd_rename_branch() {
+  require_git_repo
+  local push=0 delete_remote=0 remote="origin"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --push) push=1 ;;
+      --delete-remote) delete_remote=1 ;;
+      --remote) remote="${2:-}"; shift ;;
+      -h|--help) printf 'usage: git rename-branch <new> [--push] [--delete-remote] [--remote origin]\n'; return ;;
+      *) break ;;
+    esac
+    shift
+  done
+  local new_branch="${1:-}"
+  [[ -n "$new_branch" ]] || die "新しいブランチ名を指定してください。"
+  local old_branch
+  old_branch="$(git_current_branch)"
+  [[ -n "$old_branch" ]] || die "現在のブランチを取得できません。"
+  [[ "$old_branch" != "$new_branch" ]] || die "同じブランチ名です。"
+  git branch -m "$old_branch" "$new_branch"
+  printf "ローカルブランチを変更しました: %s -> %s\n" "$old_branch" "$new_branch"
+  if (( push )); then
+    git push --set-upstream "$remote" "$new_branch"
+    if (( delete_remote )); then
+      if confirm "古いリモートブランチ ${remote}/${old_branch} を削除しますか?" "N"; then
+        git push "$remote" --delete "$old_branch"
+      fi
+    fi
+  else
+    printf "必要なら次を実行してください: git push --set-upstream %s %s\n" "$remote" "$new_branch"
+  fi
+}
+
+cmd_delete_local_branches() {
+  require_git_repo
+  mapfile -t branches < <(git branch --merged | sed 's/^[* ]*//' | grep -Ev '^(main|master|develop)$' || true)
+  [[ ${#branches[@]} -gt 0 ]] || { printf '削除対象のブランチはありません。\n'; return; }
+  printf "以下のブランチを削除します:\n"
+  printf '  %s\n' "${branches[@]}"
+  confirm "本当に削除しますか?" "N" || { printf 'キャンセルしました。\n'; return; }
+  local branch failed=0
+  for branch in "${branches[@]}"; do
+    git branch -d "$branch" || failed=1
+  done
+  (( failed == 0 )) && printf '削除しました。\n'
+}
+
+cmd_recent() {
+  require_git_repo
+  local current
+  current="$(git_current_branch)"
+  mapfile -t branches < <(git for-each-ref --sort=-committerdate refs/heads --format='%(refname:short)' | grep -vx "$current" | head -n 10)
+  [[ ${#branches[@]} -gt 0 ]] || { printf '候補がありません。\n'; return; }
+  local i
+  for i in "${!branches[@]}"; do
+    printf '%d. %s\n' "$((i + 1))" "${branches[$i]}"
+  done
+  local selected
+  selected="$(select_from_numbered_list "切り替える番号 (Enterでキャンセル): " "${#branches[@]}")" || { printf 'キャンセルしました。\n'; return; }
+  git checkout "${branches[$((selected - 1))]}"
+}
+
+cmd_sync() {
+  require_git_repo
+  local mode="" target_branch=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -c|--continue) mode="continue" ;;
+      -a|--abort) mode="abort" ;;
+      -h|--help) printf 'usage: git sync [branch] [--continue|--abort]\n'; return ;;
+      *) target_branch="$1" ;;
+    esac
+    shift
+  done
+  if [[ "$mode" == "continue" ]]; then
+    git rebase --continue
+    return
+  fi
+  if [[ "$mode" == "abort" ]]; then
+    git rebase --abort
+    return
+  fi
+  target_branch="${target_branch:-$(git_current_branch)}"
+  local base
+  base="$(default_remote_branch)"
+  git fetch origin
+  [[ "$(git_current_branch)" == "$target_branch" ]] || git switch "$target_branch"
+  git rebase "origin/$base"
+}
+
+cmd_abort() {
+  require_git_repo
+  local op="${1:-}"
+  local git_dir
+  git_dir="$(git rev-parse --git-dir)"
+  if [[ -z "$op" ]]; then
+    [[ -d "$git_dir/rebase-merge" || -d "$git_dir/rebase-apply" ]] && op="rebase"
+    [[ -f "$git_dir/MERGE_HEAD" ]] && op="${op:-merge}"
+    [[ -f "$git_dir/CHERRY_PICK_HEAD" ]] && op="${op:-cherry-pick}"
+    [[ -f "$git_dir/REVERT_HEAD" ]] && op="${op:-revert}"
+  fi
+  [[ -n "$op" ]] || die "進行中の操作を判定できません。"
+  git "$op" --abort
+}
+
+cmd_amend() {
+  require_git_repo
+  git commit --amend "$@"
+}
+
+cmd_squash() {
+  require_git_repo
+  local count="${1:-}"
+  if [[ -z "$count" ]]; then
+    git log --oneline -10
+    read -r -p "何コミットをスカッシュしますか?: " count
+  fi
+  count="$(normalize_fullwidth_digits "$count")"
+  [[ "$count" =~ ^[0-9]+$ ]] || die "コミット数は数値で指定してください。"
+  (( count >= 2 )) || die "2 以上を指定してください。"
+  printf '対象コミット:\n'
+  git log --oneline -n "$count"
+  confirm "スカッシュしますか?" "N" || return
+  local messages tmp new_message
+  messages="$(git log --format=%s -n "$count" | tac)"
+  git reset --soft "HEAD~$count"
+  printf '元のコミットメッセージ:\n%s\n' "$messages"
+  tmp="$(mktemp)"
+  printf '%s\n' "$messages" >"$tmp"
+  open_editor "$tmp"
+  new_message="$(grep -v '^#' "$tmp" | sed '/^[[:space:]]*$/d' | paste -sd $'\n' -)"
+  rm -f "$tmp"
+  [[ -n "$new_message" ]] || die "コミットメッセージが空です。"
+  git commit -m "$new_message"
+}
+
+cmd_track() {
+  require_git_repo
+  local remote="${1:-origin}"
+  local branch="${2:-$(git_current_branch)}"
+  git ls-remote --exit-code --heads "$remote" "$branch" >/dev/null 2>&1 || {
+    git push --set-upstream "$remote" "$branch"
+    return
+  }
+  git branch --set-upstream-to="$remote/$branch" "$branch"
+}
+
+cmd_undo_last_commit() {
+  require_git_repo
+  git reset --soft HEAD^
+}
+
+cmd_issue_create() {
+  require_git_repo
+  require_gh
+  local tmp title body
+  tmp="$(mktemp)"
+  render_issue_create_template "$tmp"
+  open_editor "$tmp"
+  title="$(parse_issue_file "$tmp" | awk -F'\t' '$1=="TITLE"{print substr($0, index($0,$2))}')"
+  body="$(parse_issue_file "$tmp" | awk -F'\t' '$1=="BODY"{print substr($0, index($0,$2))}' | paste -sd $'\n' -)"
+  rm -f "$tmp"
+  [[ -n "${title//[[:space:]]/}" ]] || { printf 'タイトルが空のためキャンセルしました。\n'; return; }
+  if [[ -n "$body" ]]; then
+    gh issue create --title "$title" --body "$body"
+  else
+    gh issue create --title "$title"
+  fi
+}
+
+cmd_issue_edit() {
+  require_git_repo
+  require_gh
+  local mode="edit" issue_num=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -v|--view) mode="view" ;;
+      -m|--comment) mode="comment" ;;
+      -c|--close) mode="close" ;;
+      -h|--help) printf 'usage: git issue-edit [issue] [-v|--view|-m|--comment|-c|--close]\n'; return ;;
+      *) issue_num="$1" ;;
+    esac
+    shift
+  done
+  local row
+  if [[ -n "$issue_num" ]]; then
+    row="$(gh issue view "$issue_num" --json number,title,body,url --jq '[.number,.title, (.body // "" | gsub("\r?\n"; " ")), .url] | @tsv')"
+  else
+    row="$(choose_issue)" || { printf 'キャンセルしました。\n'; return; }
+  fi
+  local number title body url
+  IFS=$'\t' read -r number title body url <<<"$row"
+  if [[ "$mode" == "view" ]]; then
+    gh issue view "$number"
+    return
+  fi
+  local tmp parsed new_title new_body comment
+  tmp="$(mktemp)"
+  if [[ "$mode" == "edit" ]]; then
+    new_body="$(gh issue view "$number" --json body --jq '.body // ""')"
+    render_issue_edit_template "$tmp" "$number" "$title" "$new_body" "$url"
+    open_editor "$tmp"
+    parsed="$(parse_issue_file "$tmp")"
+    new_title="$(printf '%s\n' "$parsed" | awk -F'\t' '$1=="TITLE"{print substr($0, index($0,$2))}')"
+    new_body="$(printf '%s\n' "$parsed" | awk -F'\t' '$1=="BODY"{print substr($0, index($0,$2))}' | paste -sd $'\n' -)"
+    rm -f "$tmp"
+    gh issue edit "$number" --title "$new_title" --body "$new_body"
+    return
+  fi
+  render_comment_template "$tmp" "Issue #$number へのコメント"
+  open_editor "$tmp"
+  comment="$(editor_body_from_file "$tmp")"
+  rm -f "$tmp"
+  if [[ -n "${comment//[[:space:]]/}" ]]; then
+    gh issue comment "$number" --body "$comment"
+  fi
+  if [[ "$mode" == "close" ]]; then
+    gh issue close "$number"
+  fi
+}
+
+cmd_issue_bulk_close() {
+  require_git_repo
+  require_gh
+  local message="" issues=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -m|--message) message="${2:-}"; shift ;;
+      -h|--help) printf 'usage: git issue-bulk-close <issue...> [-m message]\n'; return ;;
+      *) issues+=("$(normalize_fullwidth_digits "$1")") ;;
+    esac
+    shift
+  done
+  [[ ${#issues[@]} -gt 0 ]] || die "Issue 番号を指定してください。"
+  if [[ -z "$message" ]]; then
+    local tmp
+    tmp="$(mktemp)"
+    render_comment_template "$tmp" "一括クローズ用コメント"
+    open_editor "$tmp"
+    message="$(editor_body_from_file "$tmp")"
+    rm -f "$tmp"
+  fi
+  printf '対象 Issue:\n'
+  printf '  #%s\n' "${issues[@]}"
+  confirm "一括クローズしますか?" "N" || return
+  local issue
+  for issue in "${issues[@]}"; do
+    if [[ -n "${message//[[:space:]]/}" ]]; then
+      gh issue comment "$issue" --body "$message"
+    fi
+    gh issue close "$issue" || true
+  done
+}
+
+cmd_issue_list() {
+  require_git_repo
+  require_gh
+  while true; do
+    mapfile -t ISSUE_ROWS < <(get_issue_tsv)
+    if [[ ${#ISSUE_ROWS[@]} -eq 0 ]]; then
+      printf 'Open Issue はありません。n で新規作成、q で終了です。\n'
+    else
+      printf 'Open Issue 一覧 (%d 件):\n\n' "${#ISSUE_ROWS[@]}"
+      local i number title body url
+      for i in "${!ISSUE_ROWS[@]}"; do
+        IFS=$'\t' read -r number title body url <<<"${ISSUE_ROWS[$i]}"
+        printf '%d. #%s: %s\n' "$((i + 1))" "$number" "$title"
+        [[ -n "$body" ]] && printf '   %s\n' "${body:0:80}"
+        printf '\n'
+      done
+    fi
+    read -r -p "番号 / n / bc / q: " input || true
+    input="$(normalize_fullwidth_digits "${input:-}")"
+    case "$input" in
+      q) return ;;
+      n) cmd_issue_create; continue ;;
+      bc)
+        read -r -p "クローズする Issue 番号を空白区切りで入力: " numbers || true
+        [[ -n "${numbers//[[:space:]]/}" ]] && cmd_issue_bulk_close $numbers
+        continue
+        ;;
+    esac
+    [[ "$input" =~ ^[0-9]+$ ]] || continue
+    (( input >= 1 && input <= ${#ISSUE_ROWS[@]} )) || continue
+    IFS=$'\t' read -r number title body url <<<"${ISSUE_ROWS[$((input - 1))]}"
+    printf '\n#%s %s\n%s\n\n' "$number" "$title" "$url"
+    gh issue view "$number"
+    read -r -p "e: edit / m: comment / c: close / n: new / b: back / q: quit: " action || true
+    case "${action:-b}" in
+      e) cmd_issue_edit "$number" ;;
+      m) cmd_issue_edit "$number" -m ;;
+      c) cmd_issue_edit "$number" -c ;;
+      n) cmd_issue_create ;;
+      q) return ;;
+    esac
+  done
+}
+
+cmd_pr_browse() {
+  require_git_repo
+  require_gh
+  if [[ $# -gt 0 ]]; then
+    gh pr view "$1" --web
+  else
+    gh pr view --web
+  fi
+}
+
+cmd_pause() {
+  require_git_repo
+  local to_branch="${1:-}"
+  [[ -n "$to_branch" ]] || die "切り替え先ブランチを指定してください。"
+  local from_branch stash_ref=""
+  from_branch="$(git_current_branch)"
+  if [[ -f "$PAUSE_STATE_FILE" ]]; then
+    confirm "既存の pause 状態を上書きしますか?" "N" || return
+  fi
+  if has_worktree_changes; then
+    stash_ref="$(stash_push_with_message "git-pause: from $from_branch")"
+    printf '変更を保存しました: %s\n' "$stash_ref"
+  fi
+  save_pause_state "$from_branch" "$to_branch" "$stash_ref"
+  git switch "$to_branch"
+}
+
+cmd_resume() {
+  require_git_repo
+  load_pause_state
+  git switch "$from_branch"
+  if [[ -n "${stash_ref:-}" ]]; then
+    git stash pop "$stash_ref" || {
+      printf 'stash の復元に失敗しました。手動で復元してください: git stash pop %s\n' "$stash_ref" >&2
+      clear_pause_state
+      return 1
+    }
+  fi
+  clear_pause_state
+  printf '作業を復元しました。\n'
+}
+
+cmd_pr_checkout() {
+  require_git_repo
+  require_gh
+  local pr="${1:-}" row
+  if [[ -z "$pr" ]]; then
+    row="$(gh pr list --state open --limit 1 --json number,headRefName --jq '.[0] | [.number, .headRefName] | @tsv')"
+    [[ -n "$row" ]] || die "Open PR が見つかりません。"
+    pr="${row%%$'\t'*}"
+  fi
+  local current stash_ref=""
+  current="$(git_current_branch)"
+  if has_worktree_changes; then
+    stash_ref="$(stash_push_with_message "git-pr-checkout: from $current")"
+  fi
+  save_pause_state "$current" "pr-$pr" "$stash_ref"
+  gh pr checkout "$pr"
+}
+
+cmd_pr_create_merge() {
+  require_git_repo
+  require_gh
+  local base="${1:-}"
+  if [[ -z "$base" ]]; then
+    read -r -p "マージ先ブランチ (default: main): " base || true
+    base="${base:-main}"
+  fi
+  confirm "PR を作成してマージしますか?" "N" || return
+  gh pr create --base "$base" --fill
+  gh pr merge --merge --delete-branch --auto
+  git switch "$base"
+  git pull
+}
+
+cmd_pr_issue_link() {
+  require_git_repo
+  require_gh
+  local base="" issue_numbers="" title="" body=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -b|--base) base="${2:-}"; shift ;;
+      -i|--issue) issue_numbers="${2:-}"; shift ;;
+      -t|--title) title="${2:-}"; shift ;;
+      --body) body="${2:-}"; shift ;;
+      -h|--help) printf 'usage: git pr-issue-link [-b base] [-i 1,2] [-t title] [--body body]\n'; return ;;
+    esac
+    shift
+  done
+  local current issues=()
+  current="$(git_current_branch)"
+  [[ -n "$base" ]] || { read -r -p "ベースブランチ (default: main): " base || true; base="${base:-main}"; }
+  if [[ -n "$issue_numbers" ]]; then
+    IFS=',' read -r -a issues <<<"$issue_numbers"
+  else
+    mapfile -t rows < <(get_issue_tsv)
+    if [[ ${#rows[@]} -gt 0 ]]; then
+      local i number issue_title issue_body issue_url
+      for i in "${!rows[@]}"; do
+        IFS=$'\t' read -r number issue_title issue_body issue_url <<<"${rows[$i]}"
+        printf '%d. #%s: %s\n' "$((i + 1))" "$number" "$issue_title"
+      done
+      read -r -p "Issue 番号 (例: 1,3 / all / none): " picked || true
+      picked="${picked:-none}"
+      if [[ "$picked" == "all" ]]; then
+        for row in "${rows[@]}"; do
+          IFS=$'\t' read -r number issue_title issue_body issue_url <<<"$row"
+          issues+=("$number")
+        done
+      elif [[ "$picked" != "none" ]]; then
+        IFS=',' read -r -a picks <<<"$picked"
+        for i in "${picks[@]}"; do
+          i="$(normalize_fullwidth_digits "${i//[[:space:]]/}")"
+          (( i >= 1 && i <= ${#rows[@]} )) || continue
+          IFS=$'\t' read -r number issue_title issue_body issue_url <<<"${rows[$((i - 1))]}"
+          issues+=("$number")
+        done
+      fi
+    fi
+  fi
+  [[ -n "$title" ]] || { read -r -p "PR タイトル (空なら --fill): " title || true; }
+  local final_body="$body" issue
+  if [[ ${#issues[@]} -gt 0 ]]; then
+    local closes=""
+    for issue in "${issues[@]}"; do
+      closes+="${closes:+$'\n'}Closes #${issue}"
+    done
+    final_body="${final_body:+${final_body}$'\n\n'}${closes}"
+  fi
+  confirm "PR を作成しますか?" "Y" || return
+  local args=(pr create --base "$base" --head "$current")
+  if [[ -n "$title" ]]; then
+    args+=(--title "$title")
+  else
+    args+=(--fill)
+  fi
+  [[ -n "$final_body" ]] && args+=(--body "$final_body")
+  gh "${args[@]}"
+}
+
+cmd_pr_list() {
+  require_git_repo
+  require_gh
+  gh pr list "$@"
+}
+
+cmd_pr_merge() {
+  require_git_repo
+  require_gh
+  local args=("$@")
+  local has_method=0 has_delete=0 arg
+  for arg in "${args[@]}"; do
+    [[ "$arg" == "--merge" || "$arg" == "--squash" || "$arg" == "--rebase" ]] && has_method=1
+    [[ "$arg" == "--delete-branch" ]] && has_delete=1
+  done
+  (( has_method )) || args=(--merge "${args[@]}")
+  (( has_delete )) || args=(--delete-branch "${args[@]}")
+  gh pr merge "${args[@]}"
+}
+
+cmd_release_notes() {
+  require_git_repo
+  require_gh
+  local tag="" latest=0 draft=0 prerelease=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -t|--tag) tag="${2:-}"; shift ;;
+      -l|--latest) latest=1 ;;
+      -d|--draft) draft=1 ;;
+      -p|--prerelease) prerelease=1 ;;
+      -h|--help) printf 'usage: git release-notes [-t tag|--latest] [--draft] [--prerelease]\n'; return ;;
+    esac
+    shift
+  done
+  if (( latest )); then
+    tag="$(git tag --sort=-v:refname | head -n1)"
+  fi
+  if [[ -z "$tag" ]]; then
+    mapfile -t tags < <(git tag --sort=-v:refname | head -n 10)
+    [[ ${#tags[@]} -gt 0 ]] || die "タグがありません。"
+    local i
+    for i in "${!tags[@]}"; do
+      printf '%d. %s\n' "$((i + 1))" "${tags[$i]}"
+    done
+    local selected
+    selected="$(select_from_numbered_list "タグ番号: " "${#tags[@]}")" || return
+    tag="${tags[$((selected - 1))]}"
+  fi
+  local args=(release create "$tag" --generate-notes)
+  (( draft )) && args+=(--draft)
+  (( prerelease )) && args+=(--prerelease)
+  gh "${args[@]}"
+}
+
+cmd_batch_clone() {
+  local dir="" shallow=0 file=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -d|--dir) dir="${2:-}"; shift ;;
+      -s|--shallow) shallow=1 ;;
+      -h|--help) printf 'usage: git batch-clone <file> [-d dir] [--shallow]\n'; return ;;
+      *) file="$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$file" && -f "$file" ]] || die "入力ファイルが見つかりません。"
+  [[ -n "$dir" ]] || dir="$(basename "$file")"
+  dir="${dir%.*}"
+  mkdir -p "$dir"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    local repo_name
+    repo_name="$(basename "${line%.git}")"
+    if [[ -d "$dir/$repo_name" ]]; then
+      printf '⏩ %s は既に存在します\n' "$repo_name"
+      continue
+    fi
+    if (( shallow )); then
+      git clone --depth 1 "$line" "$dir/$repo_name"
+    else
+      git clone "$line" "$dir/$repo_name"
+    fi
+  done <"$file"
+}
+
+cmd_browse() {
+  require_git_repo
+  require_gh
+  gh repo view --web
+}
+
+cmd_clone_org() {
+  require_gh
+  local org="${1:-}" limit=0 include_archived=0 shallow=0
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--limit) limit="${2:-0}"; shift ;;
+      -a|--archived) include_archived=1 ;;
+      -s|--shallow) shallow=1 ;;
+      -h|--help) printf 'usage: git clone-org <org> [--limit N] [--archived] [--shallow]\n'; return ;;
+    esac
+    shift
+  done
+  [[ -n "$org" ]] || die "組織名を指定してください。"
+  local jq_expr='.[] | select('"$([[ $include_archived -eq 1 ]] && printf 'true' || printf '.isArchived | not')"') | [.name, .url, .pushedAt] | @tsv'
+  mapfile -t repos < <(gh repo list "$org" --limit 1000 --json name,url,pushedAt,isArchived --jq "$jq_expr")
+  [[ ${#repos[@]} -gt 0 ]] || die "対象リポジトリがありません。"
+  if (( limit > 0 && ${#repos[@]} > limit )); then
+    repos=("${repos[@]:0:limit}")
+  fi
+  confirm "${#repos[@]} 個のリポジトリをクローンしますか?" "Y" || return
+  mkdir -p "$org"
+  local row name url pushed_at
+  for row in "${repos[@]}"; do
+    IFS=$'\t' read -r name url pushed_at <<<"$row"
+    if [[ -d "$org/$name" ]]; then
+      printf '⏩ %s はスキップします\n' "$name"
+      continue
+    fi
+    if (( shallow )); then
+      git clone --depth 1 "$url" "$org/$name"
+    else
+      git clone "$url" "$org/$name"
+    fi
+  done
+}
+
+cmd_create_repository() {
+  require_gh
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "リポジトリ名を指定してください。"
+  read -r -p "公開設定 (public/private, default: private): " visibility || true
+  visibility="${visibility:-private}"
+  read -r -p "説明 (任意): " description || true
+  confirm "GitHub リポジトリを作成しますか?" "Y" || return
+  local args=(repo create "$name" --clone "--${visibility}")
+  [[ -n "${description//[[:space:]]/}" ]] && args+=(--description "$description")
+  gh "${args[@]}"
+  if command -v code >/dev/null 2>&1 && [[ -d "$name" ]]; then
+    code "$name" >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_repo_others() {
+  require_gh
+  local path="." include_all=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -p|--path) path="${2:-.}"; shift ;;
+      -a|--all) include_all=1 ;;
+      -h|--help) printf 'usage: git repo-others [--path dir] [--all]\n'; return ;;
+    esac
+    shift
+  done
+  local me
+  me="$(gh api user -q '.login')"
+  mapfile -t repos < <(find "$path" -type d -name .git -prune 2>/dev/null)
+  local rows=() gitdir repo origin parsed owner repo_name last is_fork
+  for gitdir in "${repos[@]}"; do
+    repo="$(dirname "$gitdir")"
+    origin="$(git -C "$repo" remote get-url origin 2>/dev/null || true)"
+    [[ -n "$origin" ]] || continue
+    parsed="$(github_owner_repo_from_url "$origin" || true)"
+    [[ -n "$parsed" ]] || continue
+    owner="${parsed%%$'\t'*}"
+    repo_name="${parsed##*$'\t'}"
+    is_fork="false"
+    if [[ "$owner" == "$me" ]]; then
+      is_fork="$(gh api "repos/$owner/$repo_name" -q '.fork' 2>/dev/null || printf 'false')"
+    fi
+    if (( !include_all )) && [[ "$owner" == "$me" && "$is_fork" != "true" ]]; then
+      continue
+    fi
+    last="$(git -C "$repo" log -1 --format=%ct 2>/dev/null || printf '0')"
+    rows+=("${last}"$'\t'"${owner}/${repo_name}"$'\t'"$repo")
+  done
+  [[ ${#rows[@]} -gt 0 ]] || { printf '対象リポジトリがありません。\n'; return; }
+  mapfile -t rows < <(printf '%s\n' "${rows[@]}" | sort -r)
+  local page=0 page_size=10 total="${#rows[@]}"
+  while true; do
+    local start=$((page * page_size))
+    local end=$((start + page_size))
+    (( end > total )) && end=$total
+    printf '\n'
+    local idx row ts full_name repo_path
+    for ((idx = start; idx < end; idx++)); do
+      row="${rows[$idx]}"
+      IFS=$'\t' read -r ts full_name repo_path <<<"$row"
+      printf '%d. %s\n   %s\n' "$((idx + 1))" "$full_name" "$repo_path"
+    done
+    read -r -p "番号 / n / p / q: " input || true
+    case "${input:-q}" in
+      q) return ;;
+      n) (( end < total )) && ((page++)) || true ;;
+      p) (( page > 0 )) && ((page--)) || true ;;
+      *)
+        input="$(normalize_fullwidth_digits "$input")"
+        [[ "$input" =~ ^[0-9]+$ ]] || continue
+        (( input >= 1 && input <= total )) || continue
+        IFS=$'\t' read -r ts full_name repo_path <<<"${rows[$((input - 1))]}"
+        gh repo view "$full_name" --web
+        ;;
+    esac
+  done
+}
+
+cmd_stash_cleanup() {
+  require_git_repo
+  mapfile -t stashes < <(git stash list | cut -d: -f1)
+  (( ${#stashes[@]} > 1 )) || { printf '重複確認の対象が足りません。\n'; return; }
+  declare -A seen_hashes
+  local stash hash duplicates=() index
+  for stash in "${stashes[@]}"; do
+    hash="$(git stash show -p "$stash" | git hash-object --stdin)"
+    if [[ -n "${seen_hashes[$hash]:-}" ]]; then
+      duplicates+=("$stash")
+      printf '重複: %s == %s\n' "$stash" "${seen_hashes[$hash]}"
+    else
+      seen_hashes[$hash]="$stash"
+    fi
+  done
+  [[ ${#duplicates[@]} -gt 0 ]] || { printf '重複するスタッシュはありません。\n'; return; }
+  confirm "${#duplicates[@]} 個の重複 stash を削除しますか?" "N" || return
+  mapfile -t duplicates < <(
+    for stash in "${duplicates[@]}"; do
+      index="${stash#stash@\{}"
+      index="${index%\}}"
+      printf '%s\t%s\n' "$index" "$stash"
+    done | sort -rn
+  )
+  local row
+  for row in "${duplicates[@]}"; do
+    IFS=$'\t' read -r index stash <<<"$row"
+    git stash drop "stash@{$index}"
+  done
+}
+
+cmd_stash_select() {
+  require_git_repo
+  mapfile -t stashes < <(git stash list | cut -d: -f1)
+  [[ ${#stashes[@]} -gt 0 ]] || { printf 'スタッシュはありません。\n'; return; }
+  local i stash msg
+  for i in "${!stashes[@]}"; do
+    stash="${stashes[$i]}"
+    msg="$(git stash list | grep "^${stash}:" | sed "s/^${stash}: //")"
+    printf '%d. %s %s\n' "$((i + 1))" "$stash" "$msg"
+  done
+  local selected
+  selected="$(select_from_numbered_list "番号を入力してください: " "${#stashes[@]}")" || return
+  stash="${stashes[$((selected - 1))]}"
+  git stash show --name-only -u "$stash"
+  read -r -p "[a]pply / [p]op / [d]rop / [s]how / [c]ancel: " action || true
+  case "${action:-c}" in
+    a|A) git stash apply "$stash" ;;
+    p|P) git stash pop "$stash" ;;
+    d|D) git stash drop "$stash" ;;
+    s|S) git stash show -p "$stash" ;;
+  esac
+}
+
+cmd_step() {
+  require_git_repo
+  local since="" until="" weeks=0 months=0 years=0 include_initial=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -s|--since) since="${2:-}"; shift ;;
+      -u|--until) until="${2:-}"; shift ;;
+      -w|--weeks) weeks="${2:-0}"; shift ;;
+      -m|--months) months="${2:-0}"; shift ;;
+      -y|--years) years="${2:-0}"; shift ;;
+      -i|--include-initial) include_initial=1 ;;
+      -h|--help) printf 'usage: git step [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--weeks N] [--months N] [--years N] [--include-initial]\n'; return ;;
+    esac
+    shift
+  done
+  if (( years > 0 )); then
+    since="$(date -d "-${years} year" +%F 2>/dev/null || python - <<PY
+import datetime
+print((datetime.date.today().replace(year=datetime.date.today().year-$years)).isoformat())
+PY
+)"
+  elif (( months > 0 )); then
+    since="$(date -d "-${months} month" +%F 2>/dev/null || python - <<PY
+import datetime
+from calendar import monthrange
+today=datetime.date.today()
+month=today.month-$months
+year=today.year
+while month<=0:
+    month+=12
+    year-=1
+day=min(today.day, monthrange(year, month)[1])
+print(datetime.date(year, month, day).isoformat())
+PY
+)"
+  elif (( weeks > 0 )); then
+    since="$(date -d "-$((weeks * 7)) day" +%F 2>/dev/null || python - <<PY
+import datetime
+print((datetime.date.today()-datetime.timedelta(days=$((weeks * 7)))).isoformat())
+PY
+)"
+  fi
+  local tmp_stats tmp_blame tmp_valid initial hash_args=()
+  tmp_stats="$(mktemp)"
+  tmp_blame="$(mktemp)"
+  tmp_valid="$(mktemp)"
+  initial=""
+  if (( include_initial == 0 )); then
+    initial="$(git rev-list --max-parents=0 HEAD | head -n1)"
+  fi
+  if [[ -n "$since" || -n "$until" ]]; then
+    local args=(git log --all --pretty=format:%H)
+    [[ -n "$since" ]] && args+=("--since=$since")
+    [[ -n "$until" ]] && args+=("--until=$until")
+    "${args[@]}" >"$tmp_valid"
+  fi
+  local args=(git log --all --pretty=format:%H%x09%an --numstat)
+  [[ -n "$since" ]] && args+=("--since=$since")
+  [[ -n "$until" ]] && args+=("--until=$until")
+  "${args[@]}" | awk -v initial="$initial" '
+    BEGIN{FS="\t"}
+    NF==2 && $1 ~ /^[0-9a-f]{40}$/ {
+      hash=$1; author=$2;
+      if (initial != "" && hash == initial) { author=""; next }
+      key=author SUBSEP hash
+      if (!(key in seen)) { commits[author]++; seen[key]=1 }
+      current=author
+      next
+    }
+    NF>=3 && current != "" && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+      added[current]+=$1
+      deleted[current]+=$2
+    }
+    END{
+      for (author in commits) {
+        modified=added[author]+deleted[author]
+        avg=(commits[author]>0 ? modified/commits[author] : 0)
+        printf "%s\t%d\t%d\t%d\t%d\t%.2f\n", author, added[author], deleted[author], added[author]-deleted[author], commits[author], avg
+      }
+    }
+  ' >"$tmp_stats"
+  local current_lines=0 file
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    if [[ -f "$file" ]]; then
+      current_lines=$((current_lines + $(wc -l <"$file" 2>/dev/null || printf '0')))
+      if [[ -s "$tmp_valid" ]]; then
+        git blame --line-porcelain "$file" 2>/dev/null | awk '
+          /^[0-9a-f]{40} / { hash=$1; next }
+          /^author / { author=substr($0,8); print hash "\t" author }
+        ' | while IFS=$'\t' read -r hash author; do
+          grep -qx "$hash" "$tmp_valid" && printf '%s\n' "$author" >>"$tmp_blame"
+        done
+      else
+        git blame --line-porcelain "$file" 2>/dev/null | awk '/^author /{print substr($0,8)}' >>"$tmp_blame" || true
+      fi
+    fi
+  done < <(git ls-files)
+  local total_added=0 total_deleted=0 total_modified=0 total_commits=0
+  awk -F'\t' '{current[$1]++} END{for(a in current) print a "\t" current[a]}' "$tmp_blame" | sort >"${tmp_blame}.count"
+  printf '=== リポジトリステップ数統計 ===\n\n'
+  if [[ -n "$since" || -n "$until" ]]; then
+    printf '期間: %s から %s\n\n' "${since:-開始}" "${until:-現在}"
+  else
+    printf '期間: 全期間\n\n'
+  fi
+  printf '現在のリポジトリ総行数: %d 行\n\n' "$current_lines"
+  printf '%-30s %10s %10s %10s %10s %8s %10s\n' "作成者" "追加" "削除" "更新" "現在" "コミ数" "平均"
+  printf '%s\n' "$(printf '%.0s-' {1..100})"
+  while IFS=$'\t' read -r author added deleted net commits avg; do
+    local current=0 modified=$((added + deleted))
+    total_added=$((total_added + added))
+    total_deleted=$((total_deleted + deleted))
+    total_modified=$((total_modified + modified))
+    total_commits=$((total_commits + commits))
+    current="$(grep -F "$author" "${tmp_blame}.count" | awk -F'\t' '{print $2}' | head -n1)"
+    current="${current:-0}"
+    printf '%-30s %10d %10d %10d %10d %8d %10.0f\n' "$author" "$added" "$deleted" "$modified" "$current" "$commits" "$avg"
+  done < <(sort "$tmp_stats")
+  local base_name="git_step_${since//-/}"
+  [[ -n "$since" ]] || base_name="git_step_all"
+  local txt_file="${base_name}_$(date +%F).txt"
+  local csv_file="${base_name}_$(date +%F).csv"
+  {
+    printf 'current_lines,%d\n' "$current_lines"
+    printf 'total_added,%d\n' "$total_added"
+    printf 'total_deleted,%d\n' "$total_deleted"
+    printf 'total_modified,%d\n' "$total_modified"
+  } >"$txt_file"
+  {
+    printf 'author,added,deleted,net,commits,avg,current\n'
+    while IFS=$'\t' read -r author added deleted net commits avg; do
+      local current=0
+      current="$(grep -F "$author" "${tmp_blame}.count" | awk -F'\t' '{print $2}' | head -n1)"
+      printf '"%s",%s,%s,%s,%s,%s,%s\n' "$author" "$added" "$deleted" "$net" "$commits" "$avg" "${current:-0}"
+    done < <(sort "$tmp_stats")
+  } >"$csv_file"
+  printf '\n結果を %s と %s に保存しました。\n' "$txt_file" "$csv_file"
+  rm -f "$tmp_stats" "$tmp_blame" "$tmp_valid" "${tmp_blame}.count"
+}
+
+cmd_new_tag() {
+  require_git_repo
+  local type="" message="" push=0 dry_run=0 release=0 release_draft=0 release_prerelease=0 release_note=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -m|--message) message="${2:-}"; shift ;;
+      -p|--push) push=1 ;;
+      -d|--dry-run) dry_run=1 ;;
+      -r|--release) release=1 ;;
+      -D|--release-draft) release_draft=1 ;;
+      -P|--release-prerelease) release_prerelease=1 ;;
+      --release-note) release_note="${2:-}"; shift ;;
+      -h|--help) printf 'usage: git new-tag [major|minor|patch|feature|bug] [options]\n'; return ;;
+      *) type="$1" ;;
+    esac
+    shift
+  done
+  local current_tag
+  current_tag="$(git describe --tags --abbrev=0 2>/dev/null || printf 'v0.0.0')"
+  if [[ ! "$current_tag" =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    die "SemVer 形式のタグが必要です: $current_tag"
+  fi
+  local major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}" patch="${BASH_REMATCH[3]}"
+  if [[ -z "$type" ]]; then
+    printf '1. major\n2. minor\n3. patch\n'
+    read -r -p '選択 (1-3): ' pick || true
+    case "${pick:-3}" in
+      1) type="major" ;;
+      2) type="minor" ;;
+      *) type="patch" ;;
+    esac
+  fi
+  case "$type" in
+    major|m|breaking) major=$((major + 1)); minor=0; patch=0 ;;
+    minor|n|feature|f) minor=$((minor + 1)); patch=0 ;;
+    patch|p|bug|b|fix) patch=$((patch + 1)) ;;
+    *) die "無効なタイプです: $type" ;;
+  esac
+  local new_tag="v${major}.${minor}.${patch}"
+  message="${message:-Release $new_tag}"
+  printf '現在のタグ: %s\n新しいタグ: %s\nメッセージ: %s\n' "$current_tag" "$new_tag" "$message"
+  if url="$(github_compare_url "$current_tag" "$new_tag" 2>/dev/null)"; then
+    printf '差分リンク: %s\n' "$url"
+  fi
+  (( dry_run )) && return
+  confirm "タグを作成しますか?" "Y" || return
+  git tag -a "$new_tag" -m "$message"
+  if (( push )); then
+    git push origin "$new_tag"
+    if (( release )); then
+      require_gh
+      local args=(release create "$new_tag" --generate-notes)
+      (( release_draft )) && args+=(--draft)
+      (( release_prerelease )) && args+=(--prerelease)
+      gh "${args[@]}"
+      if [[ -n "${release_note//[[:space:]]/}" ]]; then
+        local body
+        body="$(gh release view "$new_tag" --json body -q '.body')"
+        gh release edit "$new_tag" --notes "${release_note}"$'\n\n'"$body"
+      fi
+    fi
+  fi
+}
+
+cmd_reset_tag() {
+  require_git_repo
+  local tag="${1:-}"
+  [[ -n "$tag" ]] || die "タグ名を指定してください。"
+  git tag -d "$tag" >/dev/null 2>&1 || true
+  git push origin ":refs/tags/$tag" >/dev/null 2>&1 || true
+  git tag "$tag"
+  git push origin "$tag"
+}
+
+cmd_tag_checkout() {
+  require_git_repo
+  local limit=10 auto_yes=0 latest_only=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--limit) limit="${2:-10}"; shift ;;
+      -y|--yes) auto_yes=1 ;;
+      -l|--latest) latest_only=1 ;;
+      -h|--help) printf 'usage: git tag-checkout [--limit N] [--yes] [--latest]\n'; return ;;
+    esac
+    shift
+  done
+  mapfile -t tags < <(git tag --sort=-v:refname | head -n "$limit")
+  [[ ${#tags[@]} -gt 0 ]] || die "タグがありません。"
+  if (( latest_only )); then
+    printf '%s\n' "${tags[0]}"
+    return
+  fi
+  if (( auto_yes )); then
+    git checkout "${tags[0]}"
+    return
+  fi
+  local i
+  for i in "${!tags[@]}"; do
+    printf '%d. %s\n' "$((i + 1))" "${tags[$i]}"
+  done
+  local selected
+  selected="$(select_from_numbered_list "タグ番号: " "${#tags[@]}")" || return
+  git checkout "${tags[$((selected - 1))]}"
+}
+
+cmd_tag_diff() {
+  require_git_repo
+  local old_tag="${1:-}" new_tag="${2:-}"
+  [[ -n "$old_tag" && -n "$new_tag" ]] || die "usage: git tag-diff <old> <new>"
+  local output_file="tag_diff_${old_tag//\//_}_to_${new_tag//\//_}.txt"
+  git log "${old_tag}..${new_tag}" --no-merges --pretty=format:'- %s (%an, %ad)' --date=short >"$output_file"
+  printf '%s\n' "$output_file"
+}
+
+cmd_tag_diff_all() {
+  require_git_repo
+  local prefix="" output="tag_diff_all.txt" split=0 limit=0 reverse=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -p|--prefix) prefix="${2:-}"; shift ;;
+      -o|--output) output="${2:-tag_diff_all.txt}"; shift ;;
+      -s|--split) split=1 ;;
+      -l|--limit) limit="${2:-0}"; shift ;;
+      -r|--reverse) reverse=1 ;;
+      -h|--help) printf 'usage: git tag-diff-all [--prefix V] [--split] [--output file] [--limit N] [--reverse]\n'; return ;;
+    esac
+    shift
+  done
+  mapfile -t tags < <(git for-each-ref refs/tags --sort=creatordate --format='%(refname:short)' | { [[ -n "$prefix" ]] && grep "^$prefix" || cat; })
+  (( limit > 0 && ${#tags[@]} > limit )) && tags=("${tags[@]: -limit}")
+  (( ${#tags[@]} >= 2 )) || die "2 つ以上のタグが必要です。"
+  if (( split )); then
+    mkdir -p tag_diffs
+  else
+    : >"$output"
+  fi
+  local start end step i old new file
+  if (( reverse )); then
+    start=$((${#tags[@]} - 1)); end=1; step=-1
+  else
+    start=1; end=$((${#tags[@]} - 1)); step=1
+  fi
+  for ((i = start; reverse ? i >= end : i <= end; i += step)); do
+    if (( reverse )); then
+      old="${tags[$((i - 1))]}"; new="${tags[$i]}"
+    else
+      old="${tags[$((i - 1))]}"; new="${tags[$i]}"
+    fi
+    if (( split )); then
+      file="tag_diffs/diff_${old//\//_}_to_${new//\//_}.txt"
+      {
+        printf '%s -> %s\n' "$old" "$new"
+        git log "${old}..${new}" --no-merges --pretty=format:'- %s (%an, %ad)' --date=short
+        printf '\n'
+      } >"$file"
+    else
+      {
+        printf '## %s -> %s\n' "$old" "$new"
+        git log "${old}..${new}" --no-merges --pretty=format:'- %s (%an, %ad)' --date=short
+        printf '\n\n'
+      } >>"$output"
+    fi
+  done
+}
+
+cmd_worktree_new() {
+  require_git_repo
+  local branch="${1:-}" no_code=0 base=""
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-code) no_code=1 ;;
+      --base) base="${2:-}"; shift ;;
+      -h|--help) printf 'usage: git worktree-new <branch> [--no-code] [--base branch]\n'; return ;;
+    esac
+    shift
+  done
+  [[ -n "$branch" ]] || die "ブランチ名を指定してください。"
+  local root repo_name worktree_path
+  root="$(git rev-parse --show-toplevel)"
+  repo_name="$(basename "$root")"
+  worktree_path="$(dirname "$root")/${repo_name}-${branch//\//-}"
+  if git show-ref --verify --quiet "refs/heads/$branch"; then
+    git worktree add "$worktree_path" "$branch"
+  elif [[ -n "$base" ]]; then
+    git worktree add -b "$branch" "$worktree_path" "$base"
+  else
+    git worktree add -b "$branch" "$worktree_path"
+  fi
+  if (( !no_code )) && command -v code >/dev/null 2>&1; then
+    code "$worktree_path" >/dev/null 2>&1 || true
+  fi
+}
+
+parse_worktrees() {
+  git worktree list --porcelain | awk '
+    /^worktree / { if (path != "") print path "\t" branch "\t" hash; path=$2; branch=""; hash="" }
+    /^HEAD / { hash=$2 }
+    /^branch / { branch=$2; sub("^refs/heads/","",branch) }
+    END { if (path != "") print path "\t" branch "\t" hash }
+  '
+}
+
+cmd_worktree_switch() {
+  require_git_repo
+  local no_code=0
+  [[ "${1:-}" == "--no-code" ]] && no_code=1
+  mapfile -t rows < <(parse_worktrees)
+  local root current filtered=() row path branch hash
+  current="$(pwd -P)"
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r path branch hash <<<"$row"
+    [[ "$path" == "$current" ]] && continue
+    filtered+=("$row")
+  done
+  [[ ${#filtered[@]} -gt 0 ]] || { printf '切り替え先の worktree はありません。\n'; return; }
+  local i
+  for i in "${!filtered[@]}"; do
+    IFS=$'\t' read -r path branch hash <<<"${filtered[$i]}"
+    printf '%d. %s\n   branch: %s\n   commit: %s\n' "$((i + 1))" "$path" "$branch" "${hash:0:7}"
+  done
+  local selected
+  selected="$(select_from_numbered_list "番号を入力してください: " "${#filtered[@]}")" || return
+  IFS=$'\t' read -r path branch hash <<<"${filtered[$((selected - 1))]}"
+  if (( !no_code )) && command -v code >/dev/null 2>&1; then
+    code "$path" >/dev/null 2>&1 || true
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+cmd_worktree_delete() {
+  require_git_repo
+  local force=0
+  [[ "${1:-}" == "--force" ]] && force=1
+  mapfile -t rows < <(parse_worktrees)
+  local current filtered=() row path branch hash args=()
+  current="$(pwd -P)"
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r path branch hash <<<"$row"
+    [[ "$path" == "$current" ]] && continue
+    filtered+=("$row")
+  done
+  [[ ${#filtered[@]} -gt 0 ]] || { printf '削除対象の worktree はありません。\n'; return; }
+  local i
+  for i in "${!filtered[@]}"; do
+    IFS=$'\t' read -r path branch hash <<<"${filtered[$i]}"
+    printf '%d. %s (%s)\n' "$((i + 1))" "$path" "$branch"
+  done
+  local selected
+  selected="$(select_from_numbered_list "削除する番号: " "${#filtered[@]}")" || return
+  IFS=$'\t' read -r path branch hash <<<"${filtered[$((selected - 1))]}"
+  confirm "worktree を削除しますか?" "N" || return
+  (( force )) && args+=(--force)
+  git worktree remove "${args[@]}" "$path"
+}
+
+dispatch() {
+  local cmd="${1:-}"
+  [[ -n "$cmd" ]] || { usage; exit 1; }
+  shift || true
+  case "$cmd" in
+    newbranch) cmd_newbranch "$@" ;;
+    rename-branch) cmd_rename_branch "$@" ;;
+    delete-local-branches) cmd_delete_local_branches "$@" ;;
+    recent) cmd_recent "$@" ;;
+    sync) cmd_sync "$@" ;;
+    abort) cmd_abort "$@" ;;
+    amend) cmd_amend "$@" ;;
+    squash) cmd_squash "$@" ;;
+    track) cmd_track "$@" ;;
+    undo-last-commit) cmd_undo_last_commit "$@" ;;
+    issue-create) cmd_issue_create "$@" ;;
+    issue-edit) cmd_issue_edit "$@" ;;
+    issue-list) cmd_issue_list "$@" ;;
+    issue-bulk-close) cmd_issue_bulk_close "$@" ;;
+    pr-browse) cmd_pr_browse "$@" ;;
+    pr-checkout) cmd_pr_checkout "$@" ;;
+    pr-create-merge) cmd_pr_create_merge "$@" ;;
+    pr-issue-link) cmd_pr_issue_link "$@" ;;
+    pr-list) cmd_pr_list "$@" ;;
+    pr-merge) cmd_pr_merge "$@" ;;
+    release-notes) cmd_release_notes "$@" ;;
+    batch-clone) cmd_batch_clone "$@" ;;
+    browse) cmd_browse "$@" ;;
+    clone-org) cmd_clone_org "$@" ;;
+    create-repository) cmd_create_repository "$@" ;;
+    repo-others) cmd_repo_others "$@" ;;
+    pause) cmd_pause "$@" ;;
+    resume) cmd_resume "$@" ;;
+    stash-cleanup) cmd_stash_cleanup "$@" ;;
+    stash-select) cmd_stash_select "$@" ;;
+    step) cmd_step "$@" ;;
+    new-tag) cmd_new_tag "$@" ;;
+    reset-tag) cmd_reset_tag "$@" ;;
+    tag-checkout) cmd_tag_checkout "$@" ;;
+    tag-diff) cmd_tag_diff "$@" ;;
+    tag-diff-all) cmd_tag_diff_all "$@" ;;
+    worktree-new) cmd_worktree_new "$@" ;;
+    worktree-switch) cmd_worktree_switch "$@" ;;
+    worktree-delete) cmd_worktree_delete "$@" ;;
+    -h|--help|help) usage ;;
+    *) die "未対応コマンドです: $cmd" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  dispatch "$@"
+fi

@@ -1,107 +1,61 @@
-## カスタムGitコマンド一覧
+# git-plus-sh
 
-### git reset tag {tag_name}
+`example/git-plus` 配下の Go 実装を Bash ベースの `git-*` コマンドへ移植したリポジトリです。
 
-```
-git tag -d {tag_name}
-git push -d origin {tag_name}
-git tag {tag_name}
-git push origin {tag_name}
-```
+各コマンドはルートの [git-plus](/C:/apps/git-plus-sh/git-plus) に集約され、`git-newbranch` や `git-pr-merge` などの薄いラッパーから呼び出します。`git` は `PATH` 上の `git-*` をサブコマンドとして解決するため、`git newbranch` の形式で利用できます。
 
-指定したタグを削除し、再作成してリモートにプッシュするコマンドです。
+## 使い方
 
----
+Git Bash / WSL / macOS / Linux など、Bash が使える環境を前提にしています。
 
-### git create branch {branch_name}
-
-```
-git branch -d {branch_name}
-git checkout -b {branch_name}
+```bash
+chmod +x git-plus git-*
+export PATH="$PATH:/c/apps/git-plus-sh"
 ```
 
-指定したブランチを削除し、新規作成してチェックアウトするコマンドです。
+動作確認:
 
----
-
-### git delete local branches
-
-マージ済みローカルブランチを一括削除するコマンドです。確認後、削除可能です。
-
----
-
-### git undo last commit
-
-最後のコミットを取り消し、変更は残したままにするコマンドです。
-
----
-
-### git diff commit files {commit_hash}
-
-指定したコミットで変更されたファイルごとに差分を出力するコマンドです。
-出力は `diff_output_{commit_hash}` ディレクトリに格納され、
-変更ファイルリストも `changed_files.txt` として保存されます。
-
----
-
-### git ai review
-
-現在の未コミットの変更点を `ai_review_diff.txt` に出力し、AIレビューに使いやすくするコマンドです。
-
----
-
-### git amend
-
-直前のコミット内容やメッセージを修正するコマンドです。
-
----
-
-### git commit branch [メッセージ]
-
-現在のブランチ名をメッセージ冒頭に付けてコミットするコマンドです。
-- 引数なし → エディタでメッセージ入力
-- 引数あり → 1行メッセージとして即時コミット（半角スペースで改行される）
-
-ステージングにファイルがない場合はエラーになります。
-
----
-
-### git squash {コミット数}
-
-指定した数の直近コミットをまとめる（スカッシュ）コマンドです。
-インタラクティブリベースでコミットを整理するのに便利です。
-
----
-
-### git checkout pull {branch_name}
-
-```
-git checkout {branch_name}
-git pull
+```bash
+git newbranch -h
+git sync -h
+git pr-merge -h
 ```
 
-## 権限付与
+直接ディスパッチャを叩くこともできます。
 
-```
-chmod +x {ファイル名}
-```
-
-スクリプトに実行権限を付与します。
-
-## フォルダの設定
-
-```
-echo 'export PATH="$PATH:/c/apps/git-plus"' >> ~/.bashrc
-source ~/.bashrc
+```bash
+./git-plus newbranch feature/demo
+./git-plus tag-checkout --latest
 ```
 
-カスタムGitコマンド用フォルダにPATHを通す手順です。
+## 移植済みコマンド
 
-## 全てに権限付与
+Go 版 `example/git-plus` から移植したコマンドは次の 39 個です。
 
-```
-chmod +x *
-```
+- Branch: `git-newbranch`, `git-rename-branch`, `git-delete-local-branches`, `git-recent`, `git-sync`, `git-abort`
+- Commit: `git-amend`, `git-squash`, `git-track`, `git-undo-last-commit`
+- Issue: `git-issue-create`, `git-issue-edit`, `git-issue-list`, `git-issue-bulk-close`
+- PR: `git-pr-browse`, `git-pr-checkout`, `git-pr-create-merge`, `git-pr-issue-link`, `git-pr-list`, `git-pr-merge`
+- Release: `git-release-notes`
+- Repo: `git-batch-clone`, `git-browse`, `git-clone-org`, `git-create-repository`, `git-repo-others`
+- Stash: `git-pause`, `git-resume`, `git-stash-cleanup`, `git-stash-select`
+- Stats: `git-step`
+- Tag: `git-new-tag`, `git-reset-tag`, `git-tag-checkout`, `git-tag-diff`, `git-tag-diff-all`
+- Worktree: `git-worktree-new`, `git-worktree-switch`, `git-worktree-delete`
 
-フォルダ内のすべてのファイルに実行権限を付与します。
+移植状況の星取表は [docs/migration-scoreboard.md](/C:/apps/git-plus-sh/docs/migration-scoreboard.md) にまとめています。
 
+## 前提ツール
+
+一部コマンドは追加ツールを必要とします。
+
+- `git`: 全コマンドで必須
+- `gh`: `pr-*`, `issue-*`, `release-notes`, `create-repository`, `clone-org`, `browse`, `repo-others`, `new-tag --release`
+- `code`: `create-repository`, `worktree-*` の VSCode 起動
+
+## 実装メモ
+
+- 共通ロジックは [git-plus](/C:/apps/git-plus-sh/git-plus) に集約しています。
+- `git pause` / `git resume` の状態は `~/.git-plus/pause-state` に保存します。
+- `git step` は Go 実装と同じくテキストと CSV を自動出力します。
+- 既存の旧シェルスクリプト (`git-create-branch` など) は互換のためそのまま残しています。
